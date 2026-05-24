@@ -1,0 +1,116 @@
+name: Auto-update CLI list
+on:
+  schedule:
+    - cron: '0 6 * * 1'  # Every Monday at 6am
+  workflow_dispatch:
+  repository_dispatch:
+    types: [cue-updated]
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: recodeee/cue
+          path: cue
+          submodules: recursive
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install cue deps
+        run: cd cue && bun install
+
+      - name: Generate CLI list
+        run: |
+          cd cue && bun -e '
+          import { listProfiles, loadProfile } from "./src/lib/profile-loader";
+          import { readFileSync, existsSync } from "node:fs";
+          import { join } from "node:path";
+
+          const SKILLS_ROOT = "resources/skills/skills";
+
+          function extractCLIs(skillId) {
+            const paths = [
+              join(SKILLS_ROOT, skillId, "SKILL.md"),
+            ];
+            for (const p of paths) {
+              if (!existsSync(p)) continue;
+              const content = readFileSync(p, "utf8");
+              const match = content.match(/allowed-tools:\s*(.+)/);
+              if (!match) continue;
+              const tools = match[1].split(",").map(t => t.trim());
+              return tools
+                .filter(t => t.startsWith("Bash("))
+                .map(t => t.match(/Bash\(([^:)]+)/)?.[1])
+                .filter(Boolean);
+            }
+            return [];
+          }
+
+          const profiles = await listProfiles();
+          const result = {};
+
+          for (const name of profiles) {
+            try {
+              const p = await loadProfile(name);
+              const clis = new Set();
+              for (const s of p.skills.local) {
+                for (const cli of extractCLIs(s.id)) clis.add(cli);
+              }
+              if (clis.size > 0) result[name] = [...clis].sort();
+            } catch {}
+          }
+
+          console.log(JSON.stringify(result, null, 2));
+          ' > /tmp/clis.json
+
+      - name: Generate README
+        run: |
+          python3 << 'EOF'
+          import json
+
+          with open("/tmp/clis.json") as f:
+              data = json.load(f)
+
+          lines = ["# awesome-clis\n"]
+          lines.append("> Auto-generated list of CLIs used across [cue](https://github.com/recodeee/cue) profiles.\n")
+          lines.append("> Updated weekly from profile skill definitions.\n\n")
+
+          # By profile
+          lines.append("## CLIs by Profile\n\n")
+          for profile, clis in sorted(data.items()):
+              lines.append(f"### {profile}\n")
+              lines.append(f"`{' '.join(clis)}`\n\n")
+
+          # All CLIs alphabetical
+          all_clis = {}
+          for profile, clis in data.items():
+              for cli in clis:
+                  all_clis.setdefault(cli, []).append(profile)
+
+          lines.append("## All CLIs (alphabetical)\n\n")
+          lines.append("| CLI | Used by |\n|-----|--------|\n")
+          for cli in sorted(all_clis.keys()):
+              profiles = ", ".join(sorted(all_clis[cli]))
+              lines.append(f"| `{cli}` | {profiles} |\n")
+
+          lines.append("\n## Related\n\n")
+          lines.append("- [cue](https://github.com/recodeee/cue) — the profile manager\n")
+          lines.append("- [cue optimizer](https://github.com/recodeee/cue#cue-optimizer--see-every-loadout-at-a-glance) — visual CLI audit\n\n")
+          lines.append("## License\n\nMIT\n")
+
+          with open("README.md", "w") as f:
+              f.writelines(lines)
+          EOF
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git diff --cached --quiet || (git commit -m "chore: auto-update CLI list from cue profiles" && git push)
